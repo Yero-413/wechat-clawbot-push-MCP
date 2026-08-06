@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechat-clawbot-push"
+version = "2.0.1"
+description = "Personal WeChat ClawBot proactive push bridge as a stdio MCP server, for WorkBuddy automations."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Yero" }]
+keywords = ["mcp", "wechat", "clawbot", "workbuddy", "push", "stdio"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Yero-413/wechat-clawbot-push-MCP"
+Repository = "https://github.com/Yero-413/wechat-clawbot-push-MCP"
+
+[project.scripts]
+wechat-clawbot-push = "wechat_clawbot_push.__main__:main"
+
+[tool.setuptools]
+packages = ["wechat_clawbot_push"]
