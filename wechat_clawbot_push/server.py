@@ -42,12 +42,31 @@ import base64
 import argparse
 import urllib.parse
 import webbrowser
+import socket
+import ssl
+import http.client
 import urllib.request
 import urllib.error
+import urllib.parse
 
 BASE_URL = "https://ilinkai.weixin.qq.com"
 CHANNEL_VERSION = "1.0.3"
 SK_ROUTE_TAG = "1001"
+
+# 网络容错参数。DNS 可能返回「建连成功但 TLS 握手卡死」的地址，
+# 因此常规通路首探用较短超时，失败后立刻改用 IPv4 直连逐个轮换。
+FIRST_TRY_TIMEOUT = 6
+IP_TRY_TIMEOUT = 8
+# --diag 里逐 IP 探测 TLS 握手用的短超时：好 IP 通常 0.1s 内完成，
+# 卡死的那个值得快点判死刑，别让诊断命令本身等上一分钟。
+TLS_PROBE_TIMEOUT = 5
+# 诊断命令用的请求超时。短于长轮询的服务端挂起时间，配合上一步的探测结果判断，
+# 既能快速出结论，又不会把"在等消息"误判成"连不上"。
+DIAG_PROBE_TIMEOUT = 10
+
+# 上一轮验证可用的 IP，命中时可跳过选路并直接使用完整 timeout。
+# 具体读写见文件后段的 IP 缓存小节（依赖 APP_DIR，故在此仅声明）。
+_LAST_GOOD_IP = None
 
 # 运行态数据放用户级目录，绝不依赖安装位置（site-packages 不可写、且多用户共享会冲突）。
 APP_DIR = os.path.join(os.path.expanduser("~"), ".workbuddy", "wechat-clawbot-push")
@@ -55,6 +74,42 @@ os.makedirs(APP_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 CACHE_PATH = os.path.join(APP_DIR, "push_cache.json")
 SETTINGS_PATH = os.path.expanduser(r"~/.workbuddy/settings.json")
+IP_CACHE_PATH = os.path.join(APP_DIR, "ip_cache.json")
+
+
+# ---- IP 缓存：把上次验证可用的地址记到磁盘，重启后首请求也不必重新探测 ----
+def _load_ip_cache():
+    """载入上次可用的 IP，避免每个新进程都从零开始探测。"""
+    global _LAST_GOOD_IP
+    try:
+        if os.path.exists(IP_CACHE_PATH):
+            with open(IP_CACHE_PATH, encoding="utf-8") as f:
+                _LAST_GOOD_IP = json.load(f).get("ip")
+    except Exception:
+        _LAST_GOOD_IP = None
+
+
+def _save_ip_cache(ip):
+    try:
+        tmp = IP_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ip": ip, "saved_at": int(time.time())}, f)
+        os.replace(tmp, IP_CACHE_PATH)
+    except Exception:
+        pass
+
+
+def _clear_ip_cache():
+    global _LAST_GOOD_IP
+    _LAST_GOOD_IP = None
+    try:
+        if os.path.exists(IP_CACHE_PATH):
+            os.remove(IP_CACHE_PATH)
+    except Exception:
+        pass
+
+
+_load_ip_cache()
 
 
 def load_config():
@@ -157,26 +212,23 @@ def _json_response(resp):
 
 def get_login_qrcode():
     """申请独立 Bot 登录二维码，不依赖 WorkBuddy 的加密 settings.json。"""
-    url = BASE_URL + "/ilink/bot/get_bot_qrcode?bot_type=3"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps({"local_token_list": []}).encode("utf-8"),
+    status, resp = _http_json(
+        BASE_URL + "/ilink/bot/get_bot_qrcode?bot_type=3",
+        data=json.dumps({"local_token_list": []}),
+        headers={
+            "Content-Type": "application/json",
+            "AuthorizationType": "ilink_bot_token",
+            "X-WECHAT-UIN": make_uin_header(),
+            "iLink-App-Id": "bot",
+        },
         method="POST",
+        timeout=20,
     )
-    req.add_header("Content-Type", "application/json")
-    req.add_header("AuthorizationType", "ilink_bot_token")
-    req.add_header("X-WECHAT-UIN", make_uin_header())
-    req.add_header("iLink-App-Id", "bot")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return _json_response(resp)
-    except urllib.error.HTTPError as e:
-        try:
-            return _json_response(e)
-        except Exception:
-            return {"status": "error", "errmsg": "HTTP %s" % e.code}
-    except Exception as e:
-        return {"status": "error", "errmsg": str(e)}
+    if status > 0 and isinstance(resp, dict):
+        return resp
+    if isinstance(resp, dict):
+        return {"status": "error", "errmsg": resp.get("errmsg", "HTTP %s" % status)}
+    return {"status": "error", "errmsg": "HTTP %s" % status}
 
 
 def get_login_status(qrcode, base_url=BASE_URL, verify_code=None):
@@ -184,13 +236,16 @@ def get_login_status(qrcode, base_url=BASE_URL, verify_code=None):
     if verify_code:
         query["verify_code"] = verify_code
     url = (base_url or BASE_URL).rstrip("/") + "/ilink/bot/get_qrcode_status?" + urllib.parse.urlencode(query)
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("iLink-App-Id", "bot")
-    try:
-        with urllib.request.urlopen(req, timeout=40) as resp:
-            return _json_response(resp)
-    except Exception as e:
-        return {"status": "wait", "errmsg": str(e)}
+    status, resp = _http_json(
+        url,
+        headers={"iLink-App-Id": "bot"},
+        method="GET",
+        timeout=40,
+    )
+    if status > 0 and isinstance(resp, dict):
+        return resp
+    # 轮询期间的单次网络抖动不应中断登录流程，交给上层继续下一轮。
+    return {"status": "wait", "errmsg": str((resp or {}).get("errmsg", "请求失败"))}
 
 
 def cmd_login():
@@ -241,26 +296,127 @@ def cmd_login():
     raise RuntimeError("二维码已等待 5 分钟仍未完成，请重新运行 --login")
 
 
-def ilink_post(path, body, secret, base_url=None, timeout=45):
-    url = (base_url or BASE_URL).rstrip("/") + path
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("AuthorizationType", "ilink_bot_token")
-    req.add_header("Authorization", "Bearer " + secret)
-    req.add_header("X-WECHAT-UIN", make_uin_header())
-    req.add_header("SKRouteTag", SK_ROUTE_TAG)
+def _log(msg):
+    """日志统一写 stderr。stdout 在 MCP 模式下只允许 JSON-RPC，绝不能被污染。"""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        sys.stderr.write("[wechat-clawbot-push] " + msg + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _ipv4_candidates(host):
+    """列出域名的全部 IPv4 地址（去重、保序）。"""
+    seen, ips = set(), []
+    try:
+        infos = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+    except Exception:
+        return ips
+    for info in infos:
+        ip = info[4][0]
+        if ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+    return ips
+
+
+def _request_on_ip(host, path, ip, data, headers, timeout, method="POST"):
+    """把单个 IPv4 直接当目标发起请求，SNI 与 Host 仍用原域名。
+
+    resolve(DNS) 常常返回「TCP 能连上、TLS 握手却卡死」的地址，而
+    socket.create_connection 只在建连阶段失败才换下一个地址，
+    握手卡住不会触发轮换，于是上层只能干等到超时。这里手动逐个 IP 试。
+    """
+    ctx = ssl.create_default_context()
+    try:
+        raw = socket.create_connection((ip, 443), timeout=timeout)
+        sock = ctx.wrap_socket(raw, server_hostname=host)
+    except Exception:
+        return -1, None
+    conn = None
+    try:
+        conn = http.client.HTTPSConnection(host, 443, timeout=timeout, context=ctx)
+        conn.sock = sock
+        conn.request(method, path, body=(data or None), headers=headers)
+        resp = conn.getresponse()
+        payload = resp.read().decode("utf-8")
+        body_json = json.loads(payload) if payload else {}
+        return resp.status, body_json
+    except Exception:
+        return -1, None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _http_json(url, data=None, headers=None, method="POST", timeout=20):
+    """统一网络出口：常规通路优先，失败后自动改用 IPv4 直连轮换。"""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    body = data.encode("utf-8") if isinstance(data, str) else (data or b"")
+    hdrs = dict(headers or {})
+
+    # 第零程：复用上次验证可用的 IP，且传完整 timeout。
+    # 长轮询(getupdates)依赖服务端挂起几十秒返回消息，不能被短超时掐断。
+    global _LAST_GOOD_IP
+    if _LAST_GOOD_IP:
+        status, resp_json = _request_on_ip(host, path, _LAST_GOOD_IP, body, hdrs, timeout, method)
+        if status > 0:
+            return status, (resp_json or {})
+        _log("已缓存的 IP %s 失效，重新选路" % _LAST_GOOD_IP)
+        _clear_ip_cache()
+
+    # 第一程：常规通路（保留代理设置）。首探刻意用较短超时，
+    # 免得被坏 IP 的 TLS 握手长时间拖住；失败还有第二程兜底。
+    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=min(timeout, FIRST_TRY_TIMEOUT)) as resp:
             payload = resp.read().decode("utf-8")
             return resp.status, (json.loads(payload) if payload else {})
     except urllib.error.HTTPError as e:
+        # HTTP 层已通（4xx/5xx 属于服务端业务结果），不必再走兜底。
         try:
             return e.code, json.loads(e.read().decode("utf-8"))
         except Exception:
             return e.code, {"ret": -1, "errmsg": str(e)}
     except Exception as e:
-        return -1, {"ret": -1, "errmsg": str(e)}
+        _log("常规通路失败(%s)，改用 IPv4 直连轮换" % str(e)[:60])
+
+    # 第二程：逐个 IPv4 强制轮换重试。
+    for ip in _ipv4_candidates(host):
+        status, resp_json = _request_on_ip(
+            host, path, ip, body, hdrs, min(timeout, IP_TRY_TIMEOUT), method
+        )
+        if status > 0:
+            _log("IPv4 直连成功 %s" % ip)
+            _LAST_GOOD_IP = ip
+            _save_ip_cache(ip)
+            return status, (resp_json or {})
+    return -1, {"ret": -1, "errmsg": "常规通路与 IPv4 直连轮换均失败"}
+
+
+def ilink_post(path, body, secret, base_url=None, timeout=45):
+    """带鉴权的 iLink 请求，走统一容错出口。"""
+    base = (base_url or BASE_URL).rstrip("/")
+    return _http_json(
+        base + path,
+        data=json.dumps(body),
+        headers={
+            "Content-Type": "application/json",
+            "AuthorizationType": "ilink_bot_token",
+            "Authorization": "Bearer " + secret,
+            "X-WECHAT-UIN": make_uin_header(),
+            "SKRouteTag": SK_ROUTE_TAG,
+        },
+        method="POST",
+        timeout=timeout,
+    )
 
 
 def _is_context_expired(resp):
@@ -468,7 +624,7 @@ def run_mcp(config):
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "wechat-clawbot-push", "version": "2.0.2"},
+                    "serverInfo": {"name": "wechat-clawbot-push", "version": "2.0.3"},
                 },
             })
         elif method == "notifications/initialized":
@@ -524,6 +680,97 @@ def cmd_refresh(config):
     print(("HTTP 成功 | " if ok else "[FAIL] ") + detail)
 
 
+def cmd_diag(config):
+    """一键自检：把「凭证 / 会话 / 代理 / DNS / 链路」五层逐项摊开。
+
+    排查时最容易混淆的是「没人发消息」和「压根连不上」——两者在上层工具返回的
+    业务文案里长得一模一样（都像"本轮无新消息"）。这个命令绕过所有业务包装，
+    直接压到网络层，把真相打出来。
+    """
+    host = urllib.parse.urlsplit(BASE_URL).hostname or ""
+    print("=== wechat-clawbot-push 自检 ===")
+
+    print("\n[1] 凭证")
+    token, source = None, None
+    for label, value in (
+        ("环境变量 WECHAT_BOT_TOKEN", os.environ.get("WECHAT_BOT_TOKEN")),
+        ("config.json", config.get("bot_token") or config.get("botToken")),
+    ):
+        if isinstance(value, str) and ":" in value:
+            token, source = value.strip(), label
+            break
+    if token is None:
+        try:
+            token = get_full_token_from_settings(config)
+            source = "WorkBuddy settings.json"
+        except Exception as e:
+            print("  读取失败: %s" % str(e)[:110])
+    if token:
+        print("  来源: %s" % source)
+        print("  形态: 长度 %d，bot_id=%s" % (len(token), token.split(":", 1)[0]))
+    else:
+        print("  [缺失] 无可用凭证。若 WorkBuddy 已加密其凭证，请用 --login 为桥单独申请。")
+    print("  配置: %s" % CONFIG_PATH)
+
+    print("\n[2] 会话缓存 (context_token)")
+    cache = load_cache()
+    uid, ctx = cache.get("user_id"), cache.get("context_token")
+    print("  user_id      : %s" % (uid or "(无)"))
+    print("  context_token: %s" % ("已缓存 %d 字符" % len(ctx) if ctx else "(无)"))
+    if uid and ctx:
+        print("  [OK] 已绑定，之后 token 失效会自动恢复。")
+    else:
+        print("  [待绑定] 请用手机给 bot 发任意一条消息。")
+
+    print("\n[3] 代理环境")
+    proxies = urllib.request.getproxies()
+    print("  %s" % (proxies if proxies else "(无，直连)"))
+    print("  注: WorkBuddy 注入的代理端口是动态的，别在配置里写死清空/强制策略。")
+    print("  当前缓存 IP: %s" % (_LAST_GOOD_IP or "(无，下次请求将重新选路)"))
+
+    print("\n[4] DNS 与 TLS 握手（逐个 IPv4，超时 %ss）" % TLS_PROBE_TIMEOUT)
+    print("  注: 部分 IP 能完成 TCP 建连却在 TLS 握手时卡死，")
+    print("      而 create_connection 只在建连失败时才换地址，不会感知握手卡死。")
+    ips = _ipv4_candidates(host)
+    print("  %s 解析出 %d 个地址" % (host, len(ips)))
+    good = []
+    for ip in ips:
+        t0 = time.time()
+        try:
+            raw = socket.create_connection((ip, 443), timeout=TLS_PROBE_TIMEOUT)
+            ssl.create_default_context().wrap_socket(raw, server_hostname=host).close()
+            good.append(ip)
+            print("  %-16s OK   %.2fs" % (ip, time.time() - t0))
+        except Exception as e:
+            print("  %-16s FAIL %s  %.2fs" % (ip, type(e).__name__, time.time() - t0))
+    if not good:
+        print("  [严重] 无一 IP 能完成握手，属本机网络或 DNS 层故障。")
+
+    # 刻意不用 getupdates：它是长轮询，服务端会挂起等待消息（可达 35 秒），
+    # 用短超时去打它必然超时，还会被误判成"IP 坏了"进而清空缓存。
+    # 验证链路要选一个「立即返回」的接口，get_bot_qrcode 正合适（且无需鉴权）。
+    print("\n[5] 实际链路请求（超时 %ss，探测接口 get_bot_qrcode）" % DIAG_PROBE_TIMEOUT)
+    t0 = time.time()
+    probe = get_login_qrcode()
+    elapsed = time.time() - t0
+    if probe.get("qrcode"):
+        print("  HTTP 200  (%.2fs)" % elapsed)
+        print("  errmsg 业务字段: %s" % (probe.get("errmsg") or "(无)"))
+        print("  => 链路与鉴权层均正常。")
+        status = 200
+    else:
+        print("  失败  (%.2fs)" % elapsed)
+        print("  错误: %s" % str(probe.get("errmsg"))[:140])
+        print("  => 三程选路全部失败，请检查本机外网。")
+        status = -1
+
+    print("\n=== 摘要 ===")
+    print("  凭证   %s" % ("OK  " if token else "缺失"))
+    print("  会话   %s" % ("OK  " if (uid and ctx) else "待绑定"))
+    print("  网络   %s" % ("OK  " if status > 0 else "失败"))
+    print("  可用IP %s" % (", ".join(good) if good else "无"))
+
+
 def cmd_test(config, text):
     ok, code, detail = do_send(text)
     print(detail)
@@ -537,6 +784,7 @@ def main():
     ap.add_argument("--login", action="store_true", help="通过微信二维码登录并保存 bot_token")
     ap.add_argument("--refresh", action="store_true", help="本地获取 token（需退出 WB 后手机发消息）")
     ap.add_argument("--test", metavar="TEXT", help="本地手动推送一条（调试）")
+    ap.add_argument("--diag", action="store_true", help="自检：凭证/会话/代理/DNS/链路逐项诊断")
     args = ap.parse_args()
     config = load_config()
     if args.login:
@@ -545,6 +793,8 @@ def main():
         run_mcp(config)
     elif args.refresh:
         cmd_refresh(config)
+    elif args.diag:
+        cmd_diag(config)
     elif args.test:
         cmd_test(config, args.test)
     else:

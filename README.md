@@ -93,6 +93,27 @@ python -m wechat_clawbot_push --login
 - 主动发优先带回最近一次入站消息的 `context_token`；会话失效时自动刷新或尝试省略该字段
 - `--login` 使用官方 `get_bot_qrcode` / `get_qrcode_status` 流程获取独立 `bot_token`
 
+## 命令行
+
+- `--mcp`：stdio MCP 服务模式（主用）
+- `--login`：扫码登录，生成桥独立的 `bot_token`
+- `--refresh`：`acquire_token` 一次，用于获取 `context_token`
+- `--diag`：自检，逐层打印凭证 / 会话 / 代理 / DNS / 链路状态
+- `--test "文本"`：手动推送一条
+
+## 网络容错
+
+DNS 轮询可能返回「TCP 能建连、TLS 握手却卡死」的地址，而 `socket.create_connection`
+只在建连失败时才换下一个 IP，**握手卡死不会触发轮换**，于是上层只能干等超时。
+因此 `ilink_post` 采用三程选路：
+
+1. 复用上次可用 IP（持久化在 `ip_cache.json`），传完整超时以保住长轮询等待窗口
+2. 常规通路（保留现有代理设置），首探短超时以便快速失败
+3. 解析全部 IPv4 逐个直连重试，SNI 与 Host 仍用原域名
+
+遇到推送异常时先跑 `--diag`：它会把「连不上」和「没人发消息」这两种表现相同、
+成因完全不同的情况区分开。
+
 ## 实现说明（stdio 铁律）
 
 - stdout 仅输出 newline-delimited JSON-RPC 消息；所有日志走 stderr
