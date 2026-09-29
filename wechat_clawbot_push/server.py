@@ -28,7 +28,8 @@ context_token / 用户微信id / 游标 缓存到用户级目录
 
 用法:
   python -m wechat_clawbot_push --mcp     # 以 stdio MCP 服务器运行（WB 连接器，主用）
-  python -m wechat_clawbot_push --refresh # 本地手动获取 token（退出 WB 后，手机发消息）
+  python -m wechat_clawbot_push --login   # 通过二维码获取并保存独立 bot_token
+  python -m wechat_clawbot_push --refresh # 本地手动获取 context_token（手机发消息）
   python -m wechat_clawbot_push --test "x" # 本地手动推送一条（调试用）
   wechat-clawbot-push --mcp               # 安装 console script 后等价
 """
@@ -39,6 +40,8 @@ import sys
 import time
 import base64
 import argparse
+import urllib.parse
+import webbrowser
 import urllib.request
 import urllib.error
 
@@ -64,6 +67,14 @@ def load_config():
     return {}
 
 
+def save_config(data):
+    os.makedirs(APP_DIR, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
 def load_cache():
     if os.path.exists(CACHE_PATH):
         try:
@@ -81,25 +92,57 @@ def save_cache(data):
     os.replace(tmp, CACHE_PATH)
 
 
-def get_full_token_from_settings():
+def _find_bot_token(value):
+    """在 WorkBuddy 配置的不同版本结构中查找 bot token。"""
+    if isinstance(value, dict):
+        for key in ("botToken", "bot_token"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and ":" in candidate:
+                return candidate.strip()
+        for child in value.values():
+            found = _find_bot_token(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_bot_token(child)
+            if found:
+                return found
+    return None
+
+
+def get_full_token_from_settings(config=None):
+    """读取鉴权 bot_token；兼容 WorkBuddy 配置移动、环境变量和手工配置。"""
+    config = config or {}
+    for value in (
+        os.environ.get("WECHAT_BOT_TOKEN"),
+        config.get("bot_token"),
+        config.get("botToken"),
+    ):
+        if isinstance(value, str) and ":" in value:
+            return value.strip()
     if not os.path.exists(SETTINGS_PATH):
         raise RuntimeError("找不到 settings.json: " + SETTINGS_PATH)
     with open(SETTINGS_PATH, encoding="utf-8") as f:
         d = json.load(f)
-    users = d.get("claw", {}).get("users", {})
-    for uid, u in users.items():
-        ch = u.get("channels", {}).get("weixinClawBot", {})
-        bt = ch.get("botToken")
-        if bt and ":" in bt:
-            return bt
-    raise RuntimeError("settings.json 中未找到 weixinClawBot.botToken")
+    found = _find_bot_token(d)
+    if found:
+        return found
+    raise RuntimeError(
+        "未找到可用的 bot_token。请确认 WorkBuddy 已完成微信连接，或在 "
+        "~/.workbuddy/wechat-clawbot-push/config.json 中配置 bot_token。"
+    )
 
 
 def resolve_token(config):
     raw = (config.get("bot_token") or "AUTO").strip()
     if not raw or raw.upper() == "AUTO":
-        return get_full_token_from_settings()
+        return get_full_token_from_settings(config)
     return raw
+
+
+def resolve_base_url(config):
+    return (config.get("base_url") or BASE_URL).rstrip("/")
 
 
 def make_uin_header():
@@ -107,8 +150,99 @@ def make_uin_header():
     return base64.b64encode(str(u).encode("ascii")).decode("ascii")
 
 
-def ilink_post(path, body, secret):
-    url = BASE_URL + path
+def _json_response(resp):
+    payload = resp.read().decode("utf-8")
+    return json.loads(payload) if payload else {}
+
+
+def get_login_qrcode():
+    """申请独立 Bot 登录二维码，不依赖 WorkBuddy 的加密 settings.json。"""
+    url = BASE_URL + "/ilink/bot/get_bot_qrcode?bot_type=3"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"local_token_list": []}).encode("utf-8"),
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("AuthorizationType", "ilink_bot_token")
+    req.add_header("X-WECHAT-UIN", make_uin_header())
+    req.add_header("iLink-App-Id", "bot")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return _json_response(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            return _json_response(e)
+        except Exception:
+            return {"status": "error", "errmsg": "HTTP %s" % e.code}
+    except Exception as e:
+        return {"status": "error", "errmsg": str(e)}
+
+
+def get_login_status(qrcode, base_url=BASE_URL, verify_code=None):
+    query = {"qrcode": qrcode}
+    if verify_code:
+        query["verify_code"] = verify_code
+    url = (base_url or BASE_URL).rstrip("/") + "/ilink/bot/get_qrcode_status?" + urllib.parse.urlencode(query)
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("iLink-App-Id", "bot")
+    try:
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            return _json_response(resp)
+    except Exception as e:
+        return {"status": "wait", "errmsg": str(e)}
+
+
+def cmd_login():
+    """通过官方二维码登录并把 bot_token 保存到 config.json。"""
+    result = get_login_qrcode()
+    qrcode = result.get("qrcode")
+    image = result.get("qrcode_img_content")
+    if not qrcode:
+        raise RuntimeError("获取登录二维码失败: " + str(result.get("errmsg") or result))
+
+    print("请使用微信扫描 ClawBot 二维码。")
+    if image:
+        print("二维码地址: " + image)
+        if isinstance(image, str) and image.startswith(("http://", "https://")):
+            try:
+                webbrowser.open(image)
+            except Exception:
+                pass
+
+    poll_base = BASE_URL
+    verify_code = None
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        status = get_login_status(qrcode, poll_base, verify_code)
+        state = status.get("status")
+        if state == "confirmed":
+            bot_token = status.get("bot_token")
+            if not bot_token or ":" not in bot_token:
+                raise RuntimeError("扫码成功但服务端没有返回有效 bot_token")
+            config = load_config()
+            config["bot_token"] = bot_token
+            if status.get("baseurl"):
+                config["base_url"] = status["baseurl"]
+            if status.get("ilink_bot_id"):
+                config["ilink_bot_id"] = status["ilink_bot_id"]
+            save_config(config)
+            print("登录成功，bot_token 已保存到: " + CONFIG_PATH)
+            return
+        if state == "need_verifycode":
+            verify_code = input("请输入微信上显示的验证码: ").strip()
+        elif state == "scaned_but_redirect":
+            redirect = status.get("redirect_host") or status.get("baseurl")
+            if redirect:
+                poll_base = redirect if redirect.startswith("http") else "https://" + redirect
+        elif state in ("expired", "verify_code_blocked", "binded_redirect"):
+            raise RuntimeError("二维码登录未完成，状态: " + str(state))
+        time.sleep(2)
+    raise RuntimeError("二维码已等待 5 分钟仍未完成，请重新运行 --login")
+
+
+def ilink_post(path, body, secret, base_url=None, timeout=45):
+    url = (base_url or BASE_URL).rstrip("/") + path
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -117,8 +251,9 @@ def ilink_post(path, body, secret):
     req.add_header("X-WECHAT-UIN", make_uin_header())
     req.add_header("SKRouteTag", SK_ROUTE_TAG)
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = resp.read().decode("utf-8")
+            return resp.status, (json.loads(payload) if payload else {})
     except urllib.error.HTTPError as e:
         try:
             return e.code, json.loads(e.read().decode("utf-8"))
@@ -126,6 +261,31 @@ def ilink_post(path, body, secret):
             return e.code, {"ret": -1, "errmsg": str(e)}
     except Exception as e:
         return -1, {"ret": -1, "errmsg": str(e)}
+
+
+def _is_context_expired(resp):
+    """iLink 对过期 context_token 既可能返回 -14，也可能只返回 ret=-2。"""
+    return resp.get("errcode") in (-14, "-14") or resp.get("ret") in (-14, -2, "-14", "-2")
+
+
+def _is_success(resp):
+    """兼容 ret/errcode 缺省、为 0 或以字符串返回的成功响应。"""
+    return (
+        resp.get("ret") in (None, 0, "0")
+        and resp.get("errcode") in (None, 0, "0")
+    )
+
+
+def _save_messages(cache, msgs):
+    """保存本轮最新会话，避免只取第一条消息导致 token 落后。"""
+    valid = [m for m in msgs if m.get("from_user_id") and m.get("context_token")]
+    if not valid:
+        return False
+    message = valid[-1]
+    cache["user_id"] = message.get("from_user_id")
+    cache["context_token"] = message.get("context_token")
+    cache["context_token_updated_at"] = int(time.time())
+    return True
 
 
 def acquire_token_once(config, wait_seconds=35):
@@ -137,19 +297,40 @@ def acquire_token_once(config, wait_seconds=35):
         "/ilink/bot/getupdates",
         {"get_updates_buf": cursor, "base_info": {"channel_version": CHANNEL_VERSION}},
         bearer,
+        base_url=resolve_base_url(config),
     )
-    if "errcode" in resp:
+    if not _is_success(resp):
         return False, "getupdates 失败: errcode %s %s" % (resp.get("errcode"), resp.get("errmsg", ""))
     if resp.get("get_updates_buf"):
         cache["get_updates_buf"] = resp["get_updates_buf"]
     msgs = resp.get("msgs") or []
     if not msgs:
         return False, "本轮无新消息（%d 秒内手机未给 bot 发消息）。token 未变化。" % wait_seconds
-    m0 = msgs[0]
-    cache["user_id"] = m0.get("from_user_id")
-    cache["context_token"] = m0.get("context_token")
+    if not _save_messages(cache, msgs):
+        return False, "收到消息但未包含可用 context_token；请让手机给 bot 发一条普通文本消息。"
     save_cache(cache)
     return True, "已获取并缓存 context_token / user_id: %s" % cache.get("user_id")
+
+
+def _refresh_context(config, cache):
+    """非阻塞地消费一次新消息，用于发送前刷新会话上下文。"""
+    bearer = resolve_token(config)
+    status, resp = ilink_post(
+        "/ilink/bot/getupdates",
+        {"get_updates_buf": cache.get("get_updates_buf", ""),
+         "base_info": {"channel_version": CHANNEL_VERSION}},
+        bearer,
+        base_url=resolve_base_url(config),
+        timeout=45,
+    )
+    if resp.get("get_updates_buf"):
+        cache["get_updates_buf"] = resp["get_updates_buf"]
+    if not _is_success(resp):
+        return False
+    changed = _save_messages(cache, resp.get("msgs") or [])
+    if changed:
+        save_cache(cache)
+    return changed
 
 
 def do_send(text):
@@ -171,11 +352,47 @@ def do_send(text):
         "item_list": [{"type": 1, "text_item": {"text": text}}],
     }
     body = {"msg": msg, "base_info": {"channel_version": CHANNEL_VERSION}}
-    status, resp = ilink_post("/ilink/bot/sendmessage", body, bearer)
-    if "errcode" in resp or resp.get("ret") == -2:
+    status, resp = ilink_post(
+        "/ilink/bot/sendmessage",
+        body,
+        bearer,
+        base_url=resolve_base_url(config),
+        timeout=20,
+    )
+    if not _is_success(resp):
         err = resp.get("errcode")
-        if err == -14:
-            return False, "TOKEN_EXPIRED", "token 已失效(errcode -14)：请重新调用 acquire_token 获取。"
+        if _is_context_expired(resp):
+            # 先尝试在不阻塞的情况下接收用户刚发来的新消息并刷新上下文。
+            if _refresh_context(config, cache):
+                refreshed = load_cache()
+                msg["to_user_id"] = refreshed.get("user_id") or user_id
+                msg["context_token"] = refreshed.get("context_token")
+                retry_status, retry_resp = ilink_post(
+                    "/ilink/bot/sendmessage",
+                    {"msg": msg, "base_info": {"channel_version": CHANNEL_VERSION}},
+                    bearer,
+                    base_url=resolve_base_url(config),
+                    timeout=20,
+                )
+                if _is_success(retry_resp):
+                    return True, "OK", "会话上下文已自动刷新，发送成功"
+                status, resp = retry_status, retry_resp
+            # 新版 iLink 会在缺省 context_token 时使用最近活跃会话。
+            msg.pop("context_token", None)
+            fallback_status, fallback_resp = ilink_post(
+                "/ilink/bot/sendmessage",
+                {"msg": msg, "base_info": {"channel_version": CHANNEL_VERSION}},
+                bearer,
+                base_url=resolve_base_url(config),
+                timeout=20,
+            )
+            if _is_success(fallback_resp):
+                return True, "OK", "已使用当前活跃会话发送成功（未携带过期 context_token）"
+            return False, "TOKEN_EXPIRED", (
+                "会话 context_token 已失效，自动刷新和无 context_token 发送均失败 "
+                "(HTTP %s, ret %s, errcode %s)。请让手机给 bot 发一条普通消息后重试。"
+                % (fallback_status, fallback_resp.get("ret"), fallback_resp.get("errcode"))
+            )
         return False, "SEND_FAIL", "HTTP %s | errcode %s | %s | ret %s" % (status, err, resp.get("errmsg", ""), resp.get("ret"))
     return True, "OK", "HTTP %s | 发送成功" % status
 
@@ -251,7 +468,7 @@ def run_mcp(config):
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "wechat-clawbot-push", "version": "2.0.1"},
+                    "serverInfo": {"name": "wechat-clawbot-push", "version": "2.0.2"},
                 },
             })
         elif method == "notifications/initialized":
@@ -317,11 +534,14 @@ def cmd_test(config, text):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mcp", action="store_true", help="以 stdio MCP 服务器模式运行（主用）")
+    ap.add_argument("--login", action="store_true", help="通过微信二维码登录并保存 bot_token")
     ap.add_argument("--refresh", action="store_true", help="本地获取 token（需退出 WB 后手机发消息）")
     ap.add_argument("--test", metavar="TEXT", help="本地手动推送一条（调试）")
     args = ap.parse_args()
     config = load_config()
-    if args.mcp:
+    if args.login:
+        cmd_login()
+    elif args.mcp:
         run_mcp(config)
     elif args.refresh:
         cmd_refresh(config)
