@@ -36,6 +36,7 @@ context_token / 用户微信id / 游标 缓存到用户级目录
 
 import json
 import os
+import re
 import sys
 import time
 import base64
@@ -75,6 +76,13 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 CACHE_PATH = os.path.join(APP_DIR, "push_cache.json")
 SETTINGS_PATH = os.path.expanduser(r"~/.workbuddy/settings.json")
 IP_CACHE_PATH = os.path.join(APP_DIR, "ip_cache.json")
+
+# WorkBuddy 自身微信连接的运行时状态目录。每次扫码授权都会生成一个新的
+# <bot_id>_im.bot.cursor.json，其 get_updates_buf（base64）解码后含完整凭证，
+# 形如 <bot_id>@im.bot:060000<hex>，与桥自己 config.json 的 bot_token 同格式。
+# 复用它即可「合二为一」：不新建 bot、不占用微信侧那个唯一的名额。
+CLAW_STATE_DIR = os.path.join(os.path.dirname(APP_DIR), "claw-state", "weixin")
+_BOT_TOKEN_RE = re.compile(r"[0-9a-f]{8,16}@im\.bot:[0-9a-fA-F]{16,}")
 
 
 # ---- IP 缓存：把上次验证可用的地址记到磁盘，重启后首请求也不必重新探测 ----
@@ -189,11 +197,102 @@ def get_full_token_from_settings(config=None):
     )
 
 
+def discover_wb_bot():
+    """从 WorkBuddy 运行时状态里复用它已绑定 bot 的凭证。
+
+    返回 (token, bot_id, source_file)；找不到返回 (None, None, None)。
+    取 mtime 最新的游标文件 —— WB 重新绑定后 bot_id 会变，动态读取才跟得上。
+    """
+    try:
+        entries = [
+            (os.path.getmtime(os.path.join(CLAW_STATE_DIR, n)), n)
+            for n in os.listdir(CLAW_STATE_DIR)
+            if n.endswith(".cursor.json")
+        ]
+    except OSError:
+        return None, None, None
+    if not entries:
+        return None, None, None
+    entries.sort()
+    name = entries[-1][1]
+    try:
+        with open(os.path.join(CLAW_STATE_DIR, name), encoding="utf-8") as f:
+            buf = json.load(f).get("get_updates_buf") or ""
+        raw = base64.b64decode(buf + "=" * (-len(buf) % 4)).decode("utf-8", "ignore")
+    except Exception:
+        return None, None, None
+    m = _BOT_TOKEN_RE.search(raw)
+    if not m:
+        return None, None, None
+    token = m.group(0)
+    return token, token.split(":", 1)[0], name
+
+
+def discover_wb_user_id():
+    """从 WorkBuddy 设置里找目标微信用户 id（形如 xxx@im.wechat）。"""
+    def walk(value):
+        if isinstance(value, dict):
+            for key in ("userId", "user_id"):
+                v = value.get(key)
+                if isinstance(v, str) and v.endswith("@im.wechat"):
+                    return v
+            for child in value.values():
+                found = walk(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = walk(child)
+                if found:
+                    return found
+        return None
+
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            return walk(json.load(f))
+    except Exception:
+        return None
+
+
+def reuse_enabled(config):
+    """是否复用 WorkBuddy 的 bot。默认开启；config 里设 reuse_wb_bot=false 关闭。"""
+    return config.get("reuse_wb_bot", True) is not False
+
+
 def resolve_token(config):
-    raw = (config.get("bot_token") or "AUTO").strip()
-    if not raw or raw.upper() == "AUTO":
-        return get_full_token_from_settings(config)
-    return raw
+    """取推送用凭证。默认优先复用 WorkBuddy 已绑定的那只 bot —— 不额外占名额。
+
+    优先级：环境变量 > 复用 WB > config 显式 bot_token > settings.json 扫描。
+    """
+    env = os.environ.get("WECHAT_BOT_TOKEN")
+    if isinstance(env, str) and ":" in env:
+        return env.strip()
+    if reuse_enabled(config):
+        token, _, _ = discover_wb_bot()
+        if token:
+            return token
+    for value in (config.get("bot_token"), config.get("botToken")):
+        if isinstance(value, str) and ":" in value:
+            v = value.strip()
+            if v.upper() != "AUTO":
+                return v
+    return get_full_token_from_settings(config)
+
+
+def _fallback_token(config, primary):
+    """取一个与 primary 不同的备选凭证，用于主凭证失效时重试。"""
+    for value in (config.get("bot_token"), config.get("botToken")):
+        if isinstance(value, str) and ":" in value:
+            v = value.strip()
+            if v.upper() != "AUTO" and v != primary:
+                return v
+    try:
+        v = get_full_token_from_settings(config)
+        if v and v != primary:
+            return v
+    except Exception:
+        pass
+    return None
 
 
 def resolve_base_url(config):
@@ -249,7 +348,17 @@ def get_login_status(qrcode, base_url=BASE_URL, verify_code=None):
 
 
 def cmd_login():
-    """通过官方二维码登录并把 bot_token 保存到 config.json。"""
+    """通过官方二维码登录并把 bot_token 保存到 config.json。
+
+    注意：扫码会给桥单独申请一只 bot，占用微信侧唯一的那个名额，从而顶掉
+    WorkBuddy 自带的微信连接。能用复用模式时不要走这条路。
+    """
+    reused, reused_id, _ = discover_wb_bot()
+    if reused:
+        print("警告：检测到 WorkBuddy 已绑定 bot %s。" % reused_id)
+        print("      扫码会另占微信侧唯一名额并把它顶掉，原生双向对话将失效。")
+        print("      若只是想让自动化结果推送到微信，无需扫码 —— 直接推送即可（默认复用模式）。")
+        print("      确要为桥单独建 bot，请继续。\n")
     result = get_login_qrcode()
     qrcode = result.get("qrcode")
     image = result.get("qrcode_img_content")
@@ -489,68 +598,75 @@ def _refresh_context(config, cache):
     return changed
 
 
-def do_send(text):
-    """用缓存的 context_token 主动发一条文本到用户微信。返回 (ok, code, detail)。"""
-    config = load_config()
-    bearer = resolve_token(config)
-    cache = load_cache()
-    user_id = config.get("user_id") or cache.get("user_id")
-    ctx = cache.get("context_token")
-    if not user_id or not ctx:
-        return False, "NO_TOKEN", "尚未获取 token：请先调用 acquire_token 工具，并在手机给 bot 发一条消息完成绑定，再执行推送。"
+def _attempt_send(text, bearer, user_id, ctx, config):
+    """发一次。ctx 为空表示不携带 context_token —— 新版 iLink 会用它最近的活跃会话。"""
     msg = {
         "from_user_id": "",
         "to_user_id": user_id,
         "client_id": "push-" + os.urandom(8).hex(),
         "message_type": 2,
         "message_state": 2,
-        "context_token": ctx,
         "item_list": [{"type": 1, "text_item": {"text": text}}],
     }
-    body = {"msg": msg, "base_info": {"channel_version": CHANNEL_VERSION}}
-    status, resp = ilink_post(
+    if ctx:
+        msg["context_token"] = ctx
+    return ilink_post(
         "/ilink/bot/sendmessage",
-        body,
+        {"msg": msg, "base_info": {"channel_version": CHANNEL_VERSION}},
         bearer,
         base_url=resolve_base_url(config),
         timeout=20,
     )
-    if not _is_success(resp):
-        err = resp.get("errcode")
-        if _is_context_expired(resp):
-            # 先尝试在不阻塞的情况下接收用户刚发来的新消息并刷新上下文。
-            if _refresh_context(config, cache):
-                refreshed = load_cache()
-                msg["to_user_id"] = refreshed.get("user_id") or user_id
-                msg["context_token"] = refreshed.get("context_token")
-                retry_status, retry_resp = ilink_post(
-                    "/ilink/bot/sendmessage",
-                    {"msg": msg, "base_info": {"channel_version": CHANNEL_VERSION}},
-                    bearer,
-                    base_url=resolve_base_url(config),
-                    timeout=20,
+
+
+def do_send(text):
+    """主动发一条文本到用户微信。返回 (ok, code, detail)。
+
+    凭证默认复用 WorkBuddy 已绑定的那只 bot（不占微信侧唯一名额），失败才回落
+    到桥自己扫码的那只。context_token 可缺省：实测 iLink 会用最近的活跃会话投递，
+    因此「先让手机给 bot 发一条消息」不再是必需步骤。
+    """
+    config = load_config()
+    bearer = resolve_token(config)
+    cache = load_cache()
+    user_id = config.get("user_id") or cache.get("user_id") or discover_wb_user_id()
+    if not user_id:
+        return False, "NO_USER", (
+            "拿不到目标微信用户 id。请确认 WorkBuddy 已完成微信连接，"
+            "或在 %s 里手工配置 user_id。" % CONFIG_PATH
+        )
+
+    tokens = [bearer]
+    alt = _fallback_token(config, bearer)
+    if alt:
+        tokens.append(alt)
+
+    ctxs = [cache.get("context_token")]
+    if ctxs[0]:
+        ctxs.append(None)
+
+    last = (-1, {})
+    for token in tokens:
+        for ctx in ctxs:
+            status, resp = _attempt_send(text, token, user_id, ctx, config)
+            if _is_success(resp):
+                return True, "OK", "HTTP %s | 发送成功%s" % (
+                    status, "" if ctx else "（未携带 context_token，走最近活跃会话）"
                 )
-                if _is_success(retry_resp):
-                    return True, "OK", "会话上下文已自动刷新，发送成功"
-                status, resp = retry_status, retry_resp
-            # 新版 iLink 会在缺省 context_token 时使用最近活跃会话。
-            msg.pop("context_token", None)
-            fallback_status, fallback_resp = ilink_post(
-                "/ilink/bot/sendmessage",
-                {"msg": msg, "base_info": {"channel_version": CHANNEL_VERSION}},
-                bearer,
-                base_url=resolve_base_url(config),
-                timeout=20,
-            )
-            if _is_success(fallback_resp):
-                return True, "OK", "已使用当前活跃会话发送成功（未携带过期 context_token）"
-            return False, "TOKEN_EXPIRED", (
-                "会话 context_token 已失效，自动刷新和无 context_token 发送均失败 "
-                "(HTTP %s, ret %s, errcode %s)。请让手机给 bot 发一条普通消息后重试。"
-                % (fallback_status, fallback_resp.get("ret"), fallback_resp.get("errcode"))
-            )
-        return False, "SEND_FAIL", "HTTP %s | errcode %s | %s | ret %s" % (status, err, resp.get("errmsg", ""), resp.get("ret"))
-    return True, "OK", "HTTP %s | 发送成功" % status
+            last = (status, resp)
+            # context 失效时先试着收一轮新消息刷新，再用新 token 重试一次。
+            if ctx and _is_context_expired(resp) and _refresh_context(config, cache):
+                fresh = load_cache().get("context_token")
+                if fresh and fresh != ctx:
+                    r_status, r_resp = _attempt_send(text, token, user_id, fresh, config)
+                    if _is_success(r_resp):
+                        return True, "OK", "HTTP %s | 发送成功（会话上下文已刷新）" % r_status
+                    last = (r_status, r_resp)
+
+    status, resp = last
+    return False, "SEND_FAIL", "HTTP %s | errcode %s | %s | ret %s" % (
+        status, resp.get("errcode"), resp.get("errmsg", ""), resp.get("ret")
+    )
 
 
 # ---- MCP 服务器（stdio）----
@@ -559,8 +675,9 @@ def run_mcp(config):
         {
             "name": "push_wechat_message",
             "description": (
-                "向用户【个人微信】(ClawBot)主动推送一条文本消息。发送前自动验证 context_token："
-                "已获取则直接推送；未获取或已失效则返回明确指引，提示先调用 acquire_token 并在手机给 bot 发消息。"
+                "向用户【个人微信】(ClawBot)主动推送一条文本消息。"
+                "默认复用 WorkBuddy 已绑定的那只 bot，不占微信侧唯一名额，原生双向对话不受影响。"
+                "无需事先扫码或绑定会话：context_token 可缺省，iLink 会投递到最近活跃会话。"
                 "供 WB 自动化在定时/触发任务完成后调用，把结果推送到用户微信。"
             ),
             "inputSchema": {
@@ -624,7 +741,7 @@ def run_mcp(config):
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "wechat-clawbot-push", "version": "2.0.3"},
+                    "serverInfo": {"name": "wechat-clawbot-push", "version": "2.0.4"},
                 },
             })
         elif method == "notifications/initialized":
@@ -691,12 +808,17 @@ def cmd_diag(config):
     print("=== wechat-clawbot-push 自检 ===")
 
     print("\n[1] 凭证")
+    reused, reused_id, reused_file = discover_wb_bot()
+    candidates = [("环境变量 WECHAT_BOT_TOKEN", os.environ.get("WECHAT_BOT_TOKEN"))]
+    if reuse_enabled(config):
+        candidates.append((
+            "复用 WorkBuddy 的 bot（%s）" % (reused_file or "未找到游标文件"),
+            reused,
+        ))
+    candidates.append(("config.json", config.get("bot_token") or config.get("botToken")))
     token, source = None, None
-    for label, value in (
-        ("环境变量 WECHAT_BOT_TOKEN", os.environ.get("WECHAT_BOT_TOKEN")),
-        ("config.json", config.get("bot_token") or config.get("botToken")),
-    ):
-        if isinstance(value, str) and ":" in value:
+    for label, value in candidates:
+        if isinstance(value, str) and ":" in value and value.strip().upper() != "AUTO":
             token, source = value.strip(), label
             break
     if token is None:
@@ -708,19 +830,25 @@ def cmd_diag(config):
     if token:
         print("  来源: %s" % source)
         print("  形态: 长度 %d，bot_id=%s" % (len(token), token.split(":", 1)[0]))
+        if reused and token == reused:
+            print("  模式: 复用 WorkBuddy 的 bot（不占名额，原生双向不受影响）")
+        else:
+            print("  模式: 桥自带的 bot（会占掉微信侧唯一名额）")
     else:
         print("  [缺失] 无可用凭证。若 WorkBuddy 已加密其凭证，请用 --login 为桥单独申请。")
     print("  配置: %s" % CONFIG_PATH)
 
-    print("\n[2] 会话缓存 (context_token)")
+    print("\n[2] 目标与会话 (context_token)")
     cache = load_cache()
     uid, ctx = cache.get("user_id"), cache.get("context_token")
-    print("  user_id      : %s" % (uid or "(无)"))
-    print("  context_token: %s" % ("已缓存 %d 字符" % len(ctx) if ctx else "(无)"))
-    if uid and ctx:
-        print("  [OK] 已绑定，之后 token 失效会自动恢复。")
+    target = uid or discover_wb_user_id()
+    print("  user_id(缓存): %s" % (uid or "(无)"))
+    print("  实际推送目标 : %s" % (target or "(无)"))
+    print("  context_token: %s" % ("已缓存 %d 字符" % len(ctx) if ctx else "(无，可缺省)"))
+    if ctx:
+        print("  [OK] 已缓存，推送会带上；失效时自动刷新或改走最近活跃会话。")
     else:
-        print("  [待绑定] 请用手机给 bot 发任意一条消息。")
+        print("  [可推送] 无缓存也能发：iLink 缺省 context_token 时投递到最近活跃会话。")
 
     print("\n[3] 代理环境")
     proxies = urllib.request.getproxies()
@@ -766,7 +894,8 @@ def cmd_diag(config):
 
     print("\n=== 摘要 ===")
     print("  凭证   %s" % ("OK  " if token else "缺失"))
-    print("  会话   %s" % ("OK  " if (uid and ctx) else "待绑定"))
+    print("  目标   %s" % ("OK  " if target else "缺失"))
+    print("  会话   %s" % ("已缓存" if ctx else "可缺省"))
     print("  网络   %s" % ("OK  " if status > 0 else "失败"))
     print("  可用IP %s" % (", ".join(good) if good else "无"))
 
