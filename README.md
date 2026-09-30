@@ -39,7 +39,7 @@
 ## 安装
 
 ```bash
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple wechat-clawbot-push==2.0.4
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple wechat-clawbot-push==2.0.5
 # 或本地源码安装
 pip install .
 ```
@@ -47,6 +47,53 @@ pip install .
 > 加 `-i` 是因为国内部分镜像（如阿里云）同步可能滞后数小时以上。不加的话，
 > 指定版本会报 `No matching distribution found`，不指定版本则会**静默装上旧版**
 > （旧版缺少网络容错，表现为推送时 TLS 握手卡死）。
+
+## 快速交接：给使用者的三步
+
+> 前提：你已在 WorkBuddy 里绑定过微信连接（设置 → 微信）。**这是唯一的扫码**，
+> 本包不再需要扫码 —— 它直接复用那只 bot，不占名额。
+
+**1️⃣ 装**
+
+```bash
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple wechat-clawbot-push==2.0.5
+```
+
+**2️⃣ 注册成连接器**
+
+编辑 `~/.workbuddy/mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "wechat-clawbot-push": {
+      "command": "wechat-clawbot-push",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+重启 WorkBuddy → 连接器管理页点「信任」→ 新任务的工具列表里出现 `push_wechat_message`。
+
+**3️⃣ 自检**
+
+```bash
+wechat-clawbot-push --diag
+```
+
+看到 `模式：复用 WorkBuddy 的 bot（不占名额）` 就成了。再试推一条：
+
+```bash
+wechat-clawbot-push --test "hello"
+```
+
+**然后怎么用**：在对话里说「把结果推到我微信」，或建自动化任务并在 prompt 里写明
+「结果用微信推送工具发给我」。触发端在 WorkBuddy，不是在微信里给 bot 发消息。
+
+⚠️ 两条最容易踩的：
+- **别跑 `--login`** —— 它会为桥单独申请一只 bot，把 WorkBuddy 的微信连接顶掉
+- **别把 `config.json` 发出去** —— 里面的 `bot_token` 等于你的微信推送权限
 
 ## 怎么用：触发端在 WorkBuddy，不在微信
 

@@ -741,7 +741,7 @@ def run_mcp(config):
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "wechat-clawbot-push", "version": "2.0.4"},
+                    "serverInfo": {"name": "wechat-clawbot-push", "version": "2.0.5"},
                 },
             })
         elif method == "notifications/initialized":
